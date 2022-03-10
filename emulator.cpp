@@ -12,7 +12,7 @@
 #include <signal.h>
 #include "keyboard.h"
 
-//The path to the keyboard and mouse (should look something like /dev/input/eventX 
+//The path to the keyboard and mouse (should look something like /dev/input/eventX)
 char KEYBOARD_PATH[] = "<YOUR-PATH>";
 char MOUSE_PATH[] = "<YOUR-PATH>";
 

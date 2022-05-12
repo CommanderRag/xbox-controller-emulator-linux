@@ -10,7 +10,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <signal.h>
-#include "keyboard.h"
+#include "keys.h"
 
 //The path to the keyboard and mouse (should look something like /dev/input/eventX)
 char KEYBOARD_PATH[] = "<YOUR-PATH>";

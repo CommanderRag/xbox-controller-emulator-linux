@@ -361,7 +361,7 @@ int main(int argc, char *argv[])
       {
 
         int toWrite = 0;
-        if (keyboard_event.value == 2)
+        if (keyboard_event.value == 2 || keyboard_event.value == 1) // on pressed or on hold key
           toWrite = 32767;
 
         //send keyboard event to gamepad

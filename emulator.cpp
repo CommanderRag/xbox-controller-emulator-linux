@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
 #include <time.h>
@@ -13,7 +14,7 @@
 #include <stdbool.h>
 
 // Keep file descriptors global so the asynchronous signal handler can clean them up
-volatile sig_atomic_with_t keep_running = 1;
+volatile sig_atomic_t keep_running = 1;
 int global_keyboard_fd = -1;
 int global_mouse_fd = -1;
 int global_gamepad_fd = -1;
@@ -23,10 +24,22 @@ char KEYBOARD_PATH[] = "/dev/input/event0";
 char MOUSE_PATH[] = "/dev/input/event1";
 
 bool q_pressed = false;
-int absXLEFT = 0;
-int absXRIGHT = 0;
-int absYUP = 0;
-int absYDOWN = 0;
+// Held state of the movement keys, so opposite keys cancel instead of the
+// last event winning (releasing W while S is held must keep the stick down).
+bool w_down = false, s_down = false, a_down = false, d_down = false;
+
+// The mouse only reports motion, never "stopped", so the right stick is
+// re-centred when no motion has arrived for this long.
+const int MOUSE_IDLE_RECENTER_MS = 30;
+bool right_stick_deflected = false;
+long long last_mouse_motion_ms = 0;
+
+static long long now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 int MOUSE_SENSITIVITY = 299;
 int MOUSE_SENSITIVITY_NEGATIVE = -299;
@@ -164,11 +177,26 @@ int main(int argc, char *argv[])
 
     while (keep_running) {
         // Blocks thread explicitly until kernel updates target descriptors. -1 means no timeout
-        int poll_ret = poll(fds, 2, -1);
+        // Block forever when idle; only wake on a timer while the right stick
+        // is deflected, so it can be re-centred after the mouse stops.
+        int timeout_ms = -1;
+        if (right_stick_deflected) {
+            long long left = MOUSE_IDLE_RECENTER_MS - (now_ms() - last_mouse_motion_ms);
+            timeout_ms = left > 0 ? (int)left : 0;
+        }
+        int poll_ret = poll(fds, 2, timeout_ms);
         if (poll_ret < 0) {
             if (errno == EINTR) continue; // Woken up by system call signal return handle
             perror("Poll system configuration crashed");
             break;
+        }
+
+        if (right_stick_deflected &&
+            now_ms() - last_mouse_motion_ms >= MOUSE_IDLE_RECENTER_MS) {
+            emit_gamepad_event(global_gamepad_fd, EV_ABS, ABS_RX, 0);
+            emit_gamepad_event(global_gamepad_fd, EV_ABS, ABS_RY, 0);
+            send_sync_event(global_gamepad_fd);
+            right_stick_deflected = false;
         }
 
         // Processing Keyboard Event
@@ -200,24 +228,17 @@ int main(int argc, char *argv[])
                         emit_gamepad_event(global_gamepad_fd, EV_KEY, BTN_A, ev.value);
                         send_sync_event(global_gamepad_fd);
                     }
-                    else if (ev.code == KEY_W) {
-                        int val = (ev.value == 1 || ev.value == 2) ? -32768 : 0;
-                        emit_gamepad_event(global_gamepad_fd, EV_ABS, ABS_Y, val);
-                        send_sync_event(global_gamepad_fd);
-                    }
-                    else if (ev.code == KEY_S) {
-                        int val = (ev.value == 1 || ev.value == 2) ? 32767 : 0;
-                        emit_gamepad_event(global_gamepad_fd, EV_ABS, ABS_Y, val);
-                        send_sync_event(global_gamepad_fd);
-                    }
-                    else if (ev.code == KEY_A) {
-                        int val = (ev.value == 1 || ev.value == 2) ? -32768 : 0;
-                        emit_gamepad_event(global_gamepad_fd, EV_ABS, ABS_X, val);
-                        send_sync_event(global_gamepad_fd);
-                    }
-                    else if (ev.code == KEY_D) {
-                        int val = (ev.value == 1 || ev.value == 2) ? 32767 : 0;
-                        emit_gamepad_event(global_gamepad_fd, EV_ABS, ABS_X, val);
+                    else if (ev.code == KEY_W || ev.code == KEY_S ||
+                             ev.code == KEY_A || ev.code == KEY_D) {
+                        bool down = (ev.value != 0);   // 1 = press, 2 = autorepeat, 0 = release
+                        if (ev.code == KEY_W) w_down = down;
+                        if (ev.code == KEY_S) s_down = down;
+                        if (ev.code == KEY_A) a_down = down;
+                        if (ev.code == KEY_D) d_down = down;
+                        int x = (d_down ? 32767 : 0) + (a_down ? -32768 : 0);
+                        int y = (s_down ? 32767 : 0) + (w_down ? -32768 : 0);
+                        emit_gamepad_event(global_gamepad_fd, EV_ABS, ABS_X, x == -1 ? 0 : x);
+                        emit_gamepad_event(global_gamepad_fd, EV_ABS, ABS_Y, y == -1 ? 0 : y);
                         send_sync_event(global_gamepad_fd);
                     }
                     else if (ev.code == KEY_C && ev.value != 2) {
@@ -245,6 +266,8 @@ int main(int argc, char *argv[])
         if (fds[1].revents & POLLIN) {
             while (read(global_mouse_fd, &ev, sizeof(struct input_event)) > 0) {
                 if (ev.type == EV_REL) {
+                    right_stick_deflected = true;
+                    last_mouse_motion_ms = now_ms();
                     if (ev.code == REL_X) {
                         int toWrite = (ev.value > 0) ? MOUSE_SENSITIVITY : ((ev.value < 0) ? MOUSE_SENSITIVITY_NEGATIVE : 0);
                         emit_gamepad_event(global_gamepad_fd, EV_ABS, ABS_RX, toWrite);
